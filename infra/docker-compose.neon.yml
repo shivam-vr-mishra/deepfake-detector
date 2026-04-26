@@ -1,0 +1,46 @@
+# =============================================================
+# DeepFake Detector — Neon overlay
+#
+# Use when DB_TARGET=neon (the default). Disables the local Postgres
+# container because the database lives on Neon. Everything else
+# (redis, minio, clamav, backend, worker, flower, frontend) is
+# unchanged from the base compose file.
+#
+# This file is applied automatically by start.sh / start.ps1 when
+# DB_TARGET=neon. To use it manually:
+#
+#   docker compose \
+#     -f infra/docker-compose.yml \
+#     -f infra/docker-compose.neon.yml \
+#     up -d --build
+#
+# Requires Docker Compose >= v2.24.4 (for the !override directive).
+# Docker Desktop 4.27+ ships with this.
+# =============================================================
+
+name: deepfake-detector
+
+services:
+  # The local Postgres container is gated behind a profile that never
+  # activates, so it never starts when Neon is in use.
+  postgres:
+    profiles: ["donotstart"]
+
+  # Backend no longer waits on the local postgres service.
+  # `!override` tells Compose to REPLACE the entire depends_on map
+  # from the base file rather than merging into it.
+  backend:
+    depends_on: !override
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  # Worker uses short-form depends_on in the base file; replace
+  # similarly so the postgres entry is gone from its dependencies too.
+  worker:
+    depends_on: !override
+      - backend
+      - redis
+      - minio
+      - clamav

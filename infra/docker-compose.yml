@@ -1,0 +1,156 @@
+# =============================================================
+# DeepFake Detector — Full Stack
+# Run from repo root:  docker compose -f infra/docker-compose.yml up -d --build
+# =============================================================
+
+name: deepfake-detector
+
+x-common-env: &common_env
+  env_file:
+    - ../.env
+
+services:
+  # ----------------- Postgres -----------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-deepfake}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-deepfake_pw}
+      POSTGRES_DB: ${POSTGRES_DB:-deepfake_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-deepfake}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"
+
+  # ----------------- Redis -----------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "6379:6379"
+
+  # ----------------- MinIO (S3) -----------------
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------- ClamAV -----------------
+  # Provides the clamd TCP daemon used by app/security/virus_scanner.py.
+  # First start downloads virus signatures (~5-10 min, ~500MB).
+  clamav:
+    image: clamav/clamav:stable
+    restart: unless-stopped
+    environment:
+      CLAMAV_NO_FRESHCLAMD: "false"
+      CLAMAV_NO_CLAMD: "false"
+      CLAMD_STARTUP_TIMEOUT: "1800"
+    volumes:
+      - clamav_data:/var/lib/clamav
+    ports:
+      - "3310:3310"
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 12
+      start_period: 600s
+
+  # ----------------- FastAPI backend -----------------
+  backend:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    <<: *common_env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - models_cache:/models_cache
+
+  # ----------------- Celery workers -----------------
+  # Reuses the backend image — same Python deps, just a different command.
+  worker:
+    image: deepfake-detector-backend
+    restart: unless-stopped
+    <<: *common_env
+    depends_on:
+      - backend
+      - redis
+      - minio
+      - clamav
+    command: >
+      celery -A app.workers.celery_app.celery_app worker
+      --loglevel=info
+      -Q image,video,audio,text,url
+      --concurrency=4
+    volumes:
+      - models_cache:/models_cache
+
+  # ----------------- Flower (Celery dashboard) -----------------
+  flower:
+    image: deepfake-detector-backend
+    restart: unless-stopped
+    <<: *common_env
+    depends_on:
+      - redis
+      - worker
+    command: >
+      celery -A app.workers.celery_app.celery_app flower --port=5555
+    ports:
+      - "5555:5555"
+
+  # ----------------- Next.js frontend -----------------
+  frontend:
+    build:
+      context: ..
+      dockerfile: frontend/Dockerfile
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      NEXT_PUBLIC_RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  clamav_data:
+  models_cache:

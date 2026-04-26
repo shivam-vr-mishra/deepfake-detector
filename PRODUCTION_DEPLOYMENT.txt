@@ -1,0 +1,777 @@
+================================================================================
+DEEPFAKE DETECTOR — PRODUCTION DEPLOYMENT GUIDE (FREE TIER, SECURE)
+================================================================================
+
+This document tells you exactly how to take the project from local Docker to
+a production deployment using free, reliable, secure managed services.
+
+Target: zero monthly cost up to "early traction" usage, full TLS / encryption
+at rest, daily backups, and standard production security practices.
+
+────────────────────────────────────────────────────────────────────────────────
+TABLE OF CONTENTS
+────────────────────────────────────────────────────────────────────────────────
+
+  1. RECOMMENDED FREE PRODUCTION STACK (TL;DR)
+  2. DATABASE — managed Postgres options compared
+     2.1  Neon              (recommended)
+     2.2  Supabase
+     2.3  CockroachDB Serverless
+     2.4  Aiven / Tembo / Render
+     2.5  Step-by-step: deploy on Neon
+  3. OBJECT STORAGE — managed S3-compatible options compared
+     3.1  Cloudflare R2     (recommended — zero egress fee)
+     3.2  Backblaze B2
+     3.3  AWS S3
+     3.4  Step-by-step: deploy on Cloudflare R2
+  4. REDIS — managed options
+  5. APPLICATION HOSTING — backend + worker + frontend
+  6. PRODUCTION SECURITY CHECKLIST
+  7. SECRETS MANAGEMENT
+  8. BACKUPS, MONITORING, INCIDENT RESPONSE
+  9. WHAT NOT TO DO
+
+
+================================================================================
+1. RECOMMENDED FREE PRODUCTION STACK (TL;DR)
+================================================================================
+
+  ┌────────────────────────┬───────────────────────────────────┬──────────────┐
+  │ Component              │ Provider                          │ Free quota   │
+  ├────────────────────────┼───────────────────────────────────┼──────────────┤
+  │ Postgres database      │ Neon (https://neon.tech)          │ 0.5 GB / 191 │
+  │                        │                                   │ compute hrs  │
+  │ S3-compatible storage  │ Cloudflare R2                     │ 10 GB stored │
+  │ (uploaded files)       │                                   │ ZERO egress  │
+  │ Redis (queue + cache)  │ Upstash Redis                     │ 10k cmds/day │
+  │                        │                                   │ 256 MB       │
+  │ Backend + Worker host  │ Fly.io   OR  Railway  OR  Render  │ small free   │
+  │                        │                                   │ tier each    │
+  │ Frontend host          │ Vercel  OR  Cloudflare Pages      │ generous     │
+  │ DNS + TLS proxy        │ Cloudflare (free)                 │ unlimited    │
+  │ ClamAV (antivirus)     │ Self-hosted on backend host       │ included     │
+  │ Email (SMTP)           │ Brevo / Resend / SES              │ 100-300/day  │
+  │ Payments               │ Razorpay test → live              │ pay-per-txn  │
+  │ Secrets                │ Provider env vars OR Doppler/SOPS │ free         │
+  └────────────────────────┴───────────────────────────────────┴──────────────┘
+
+This stack has TLS everywhere, encryption at rest by default, daily backups
+on the DB, and is genuinely safe to run in production. None of it requires
+a credit card to start.
+
+
+================================================================================
+2. DATABASE — MANAGED POSTGRES OPTIONS
+================================================================================
+
+The project's code is already 100% compatible with any managed Postgres —
+no code changes needed, only a new DATABASE_URL.
+
+────────────────────────────────────────────────────────────────────────────
+2.1  NEON  — RECOMMENDED
+────────────────────────────────────────────────────────────────────────────
+
+   Why: best Postgres free tier in 2026; Postgres 16/17; instant scale-to-
+        zero (idle DB costs nothing); branching for dev/test environments;
+        point-in-time restore; TLS required on all connections; encrypted
+        at rest (AES-256); SOC 2 Type II; HIPAA available on paid plans.
+
+   Free tier:
+       - 0.5 GB storage per branch
+       - 191 compute hours / month (≈ always-on with auto-suspend)
+       - Daily backups (7-day retention on free)
+       - 1 project, multiple branches
+       - Read replicas on paid plans
+
+   Connection format (always TLS):
+       postgresql://USER:PASSWORD@ep-xxxx.us-east-2.aws.neon.tech/dbname?sslmode=require
+
+   Region selection: pick the region closest to your application host
+   (latency dominates for OLTP workloads — keep DB and API in the same
+   region/cloud).
+
+   Sufficient for: this project up to roughly 10,000 users / 100,000 scans
+   in the audit log before you hit 0.5 GB. Beyond that, the $19/mo
+   "Launch" plan gets you 10 GB.
+
+────────────────────────────────────────────────────────────────────────────
+2.2  SUPABASE
+────────────────────────────────────────────────────────────────────────────
+
+   Why: Postgres + bundled auth/realtime/storage; great if you want
+        web-based admin UI; very developer-friendly.
+
+   Free tier:
+       - 500 MB DB, 5 GB bandwidth, 1 GB file storage
+       - Pauses after 7 days of inactivity (un-pause = 1 click)
+       - 2 free projects
+       - TLS required, encrypted at rest
+
+   Trade-off: pause behavior makes it less suitable for "live but sleepy"
+   production. Better for staging or projects with steady traffic.
+
+   Connection format:
+       postgresql://postgres:[PWD]@db.[ref].supabase.co:5432/postgres?sslmode=require
+
+   Use the "transaction pooler" endpoint (port 6543) when you have many
+   short-lived connections (e.g. serverless functions). For Docker workloads
+   the direct port 5432 works.
+
+────────────────────────────────────────────────────────────────────────────
+2.3  COCKROACHDB SERVERLESS  (Postgres wire-compatible)
+────────────────────────────────────────────────────────────────────────────
+
+   Why: distributed Postgres-compatible DB; horizontal scaling out of the
+        box; survives regional failures.
+
+   Free tier:
+       - 10 GB storage
+       - 50M Request Units / month
+       - Multi-region available on free tier (pick one)
+       - TLS required, encrypted at rest, SOC 2
+
+   Caveat: not 100% Postgres feature-compat. Most apps work, but you should
+   test. The DeepFake Detector schema works fine (we tested with portable
+   types in CONFIGURATION.txt §2.5).
+
+   Connection format:
+       postgresql://USER:PWD@cluster.cockroachlabs.cloud:26257/defaultdb?sslmode=verify-full
+
+────────────────────────────────────────────────────────────────────────────
+2.4  OTHER OPTIONS
+────────────────────────────────────────────────────────────────────────────
+
+   AIVEN          — 1 month free trial, then paid; great UX, multi-cloud
+   TEMBO CLOUD    — Postgres+extensions, free hobby tier
+   RENDER         — free tier expires after 90 days (NOT recommended for prod)
+   RAILWAY        — $5 trial credit only; pay-as-you-go after
+   ELEPHANTSQL    — DEAD; shut down January 2025
+   HEROKU POSTGRES — no longer free
+   AWS RDS        — 12-month free tier only, then ~$15/mo for db.t3.micro
+
+────────────────────────────────────────────────────────────────────────────
+2.5  STEP-BY-STEP: DEPLOY ON NEON
+────────────────────────────────────────────────────────────────────────────
+
+   Step 1 — sign up at https://console.neon.tech (GitHub login is fine).
+
+   Step 2 — Create project:
+       Name: deepfake-detector
+       Region: choose the region nearest your backend host
+       Postgres version: 16 (default)
+
+   Step 3 — Inside the project, click "Connection Details".
+       Copy the connection string. It will look like:
+           postgresql://USER:PWD@ep-xxxx-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require
+
+       IMPORTANT: use the POOLED endpoint (it has "-pooler" in the host).
+       This handles Postgres connection limits correctly under load.
+
+   Step 4 — In your production .env, set:
+           DATABASE_URL=postgresql+psycopg2://USER:PWD@ep-xxxx-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require
+
+       Note the "+psycopg2" part — required by SQLAlchemy.
+
+   Step 5 — Edit infra/docker-compose.yml:
+           a) Comment out the entire `postgres:` service block.
+           b) Remove `postgres` from `depends_on:` of `backend` and `worker`.
+           c) Optionally also remove the `postgres_data` volume.
+
+   Step 6 — Restrict access (recommended):
+       In Neon dashboard → Settings → "IP Allow":
+           Add: <your application host's static IP>
+       (Skip this if your host has dynamic IPs; the password+TLS is
+       still strong protection.)
+
+   Step 7 — Bring up the stack:
+           docker compose -f infra/docker-compose.yml --env-file .env up -d --build
+
+   Step 8 — Verify the schema was bootstrapped:
+           # The lifespan in app/main.py auto-creates tables in non-production
+           # FOR PRODUCTION: set APP_ENV=production and use Alembic migrations.
+           # See CONFIGURATION.txt §2.5 for Alembic setup.
+
+   Step 9 — Test:
+           curl https://YOUR-API-DOMAIN/health
+           # → {"status":"ok","clamav":true}
+
+   Step 10 — Set up branching for dev/staging:
+       In Neon, click "New branch" off main → instant copy-on-write
+       branch with its own connection string. Use it for staging
+       environment without touching production data.
+
+
+================================================================================
+3. OBJECT STORAGE — MANAGED S3-COMPATIBLE OPTIONS
+================================================================================
+
+The MinIO Python client speaks the S3 protocol, so this is a drop-in
+replacement — just change MINIO_ENDPOINT and credentials.
+
+────────────────────────────────────────────────────────────────────────────
+3.1  CLOUDFLARE R2  — RECOMMENDED (the killer feature is ZERO egress)
+────────────────────────────────────────────────────────────────────────────
+
+   Free tier:
+       - 10 GB storage
+       - 1 million Class A operations / month (writes, listings)
+       - 10 million Class B operations / month (reads)
+       - ZERO egress / bandwidth fees ★ the big one
+       - TLS-only access, encrypted at rest
+
+   Why this wins for this project: detection videos can be large and users
+   may re-download/preview them. R2's zero egress means downloads cost
+   nothing. AWS S3 charges $0.09/GB egress which adds up fast.
+
+   Endpoint format:
+       https://<account-id>.r2.cloudflarestorage.com
+
+   Compatible with the MinIO SDK we use (S3 v4 signatures). Works as a
+   drop-in replacement.
+
+────────────────────────────────────────────────────────────────────────────
+3.2  BACKBLAZE B2  (alternative)
+────────────────────────────────────────────────────────────────────────────
+
+   Free tier:
+       - 10 GB storage
+       - 1 GB / day egress
+       - 2,500 Class C transactions / day
+       - TLS, encrypted at rest
+
+   B2 has an S3-compatible API endpoint:
+       https://s3.<region>.backblazeb2.com
+
+────────────────────────────────────────────────────────────────────────────
+3.3  AWS S3
+────────────────────────────────────────────────────────────────────────────
+
+   Free tier (12 months ONLY):
+       - 5 GB Standard storage
+       - 20,000 GET, 2,000 PUT requests
+       - 100 GB egress / month
+       After 12 months: ~$0.023/GB-month + $0.09/GB egress.
+
+   Use only if you specifically need other AWS services in the same VPC.
+
+────────────────────────────────────────────────────────────────────────────
+3.4  STEP-BY-STEP: DEPLOY ON CLOUDFLARE R2
+────────────────────────────────────────────────────────────────────────────
+
+   Step 1 — Sign up at https://dash.cloudflare.com (free).
+
+   Step 2 — Cloudflare dashboard → R2 → "Get started" → enable R2 (no card
+            required, 10 GB free permanently).
+
+   Step 3 — "Create bucket":
+       Name: deepfake-uploads-prod
+       Location: Automatic (or pick the region closest to your app host)
+       (No public access — this is a private bucket. Files will be
+       served via presigned URLs from our backend.)
+
+   Step 4 — Generate API token:
+       R2 → Manage R2 API Tokens → "Create API Token"
+       Permissions: Object Read & Write
+       Bucket: only `deepfake-uploads-prod` (principle of least privilege)
+       TTL: forever (or rotate periodically)
+
+       Save the:
+           Access Key ID
+           Secret Access Key
+           Endpoint                (format: https://<acct-id>.r2.cloudflarestorage.com)
+
+   Step 5 — Update production .env:
+           MINIO_ENDPOINT=<acct-id>.r2.cloudflarestorage.com
+           MINIO_ACCESS_KEY=<access key id from step 4>
+           MINIO_SECRET_KEY=<secret access key from step 4>
+           MINIO_BUCKET=deepfake-uploads-prod
+           MINIO_SECURE=true
+
+       NOTE: MINIO_ENDPOINT has NO scheme (no https://). The MINIO_SECURE
+       flag controls scheme.
+
+   Step 6 — In infra/docker-compose.yml:
+           a) Comment out the entire `minio:` service block.
+           b) Remove `minio` from `depends_on:` of `backend` and `worker`.
+           c) Optionally remove the `minio_data` volume.
+
+   Step 7 — Recreate:
+           docker compose -f infra/docker-compose.yml --env-file .env up -d --force-recreate backend worker
+
+   Step 8 — Test by uploading a small image via /detect/image. Verify it
+            appears in the R2 dashboard:
+           Cloudflare → R2 → deepfake-uploads-prod → Objects.
+
+   Step 9 — Set bucket lifecycle (optional): auto-delete objects older
+            than N days to keep storage usage low. R2 dashboard → bucket
+            settings → "Object lifecycle rules".
+
+
+================================================================================
+4. REDIS — MANAGED OPTIONS
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────
+4.1  UPSTASH REDIS  (recommended)
+────────────────────────────────────────────────────────────────────────────
+
+   Free tier:
+       - 256 MB storage
+       - 10,000 commands / day
+       - TLS available (rediss://)
+       - REST API alternative
+       - Global replication on paid plans
+
+   Suitable for: rate-limit counters and Celery result backend at low-to-
+   medium volume. If you exceed 10k commands/day, the Pay-as-you-go plan
+   is $0.20 per 100k commands — typically <$5/mo.
+
+   Connection format:
+       rediss://default:PASSWORD@global-something.upstash.io:6379
+
+   Configure in .env (use the same URL for all three):
+       REDIS_URL=rediss://default:PWD@host:6379/0
+       CELERY_BROKER_URL=rediss://default:PWD@host:6379/0
+       CELERY_RESULT_BACKEND=rediss://default:PWD@host:6379/0
+
+   Note: Upstash uses logical DB 0 only. Don't try /1, /2 — they'll error.
+
+────────────────────────────────────────────────────────────────────────────
+4.2  REDIS CLOUD (by Redis Inc.)
+────────────────────────────────────────────────────────────────────────────
+
+   Free tier: 30 MB. Smaller than Upstash; only useful for the absolute
+   minimum.
+
+────────────────────────────────────────────────────────────────────────────
+4.3  SELF-HOSTED ON BACKEND HOST
+────────────────────────────────────────────────────────────────────────────
+
+   If your backend host (Fly.io, Railway, Render) supports persistent
+   sidecar services, you can keep Redis in the same docker-compose. Saves
+   the network hop and no third-party data transit.
+
+   This is what the local docker-compose already does.
+
+
+================================================================================
+5. APPLICATION HOSTING (BACKEND, WORKER, FRONTEND)
+================================================================================
+
+The DeepFake Detector backend runs as 3 long-running containers (backend,
+worker, flower) plus optionally clamav. The frontend is a Next.js app.
+
+────────────────────────────────────────────────────────────────────────────
+5.1  FLY.IO  (recommended for the backend stack)
+────────────────────────────────────────────────────────────────────────────
+
+   Why: real Docker support, persistent volumes, multi-region, custom
+        domains with auto-TLS, scale to zero on free tier.
+
+   Free allowance:
+       - 3 shared-cpu-1x VMs (256 MB each) — good for backend + worker
+       - 3 GB persistent volume
+       - 160 GB outbound transfer
+
+   Caveat: AI models need ~2 GB RAM. Bump worker to a `shared-cpu-2x`
+   (1 GB RAM) — currently $1.94/mo. Backend + flower stay free.
+
+   Auto-provisions Let's Encrypt TLS for any custom domain.
+
+────────────────────────────────────────────────────────────────────────────
+5.2  RAILWAY
+────────────────────────────────────────────────────────────────────────────
+
+   Why: easiest deployment from a Dockerfile, "starter" plan ($5/mo
+        once trial expires).
+
+   Free trial: $5 of compute time only. Not truly free long-term.
+
+────────────────────────────────────────────────────────────────────────────
+5.3  RENDER
+────────────────────────────────────────────────────────────────────────────
+
+   Free web service: spins down after 15 min of inactivity (cold start
+   ~30s). NOT suitable for a Celery worker (needs to stay alive).
+
+   Free background worker: NOT available. Workers require paid plan
+   ($7/mo). For a real production deploy of this stack, Fly.io is better.
+
+────────────────────────────────────────────────────────────────────────────
+5.4  VERCEL  (frontend only)
+────────────────────────────────────────────────────────────────────────────
+
+   Why: best Next.js hosting, generous free tier, automatic preview
+        deployments per PR, edge network.
+
+   Free tier:
+       - 100 GB bandwidth
+       - 6,000 build minutes
+       - Custom domains with auto-TLS
+       - Serverless functions
+
+   Set environment variables in the Vercel dashboard:
+       NEXT_PUBLIC_API_URL=https://api.yourdomain.com
+       NEXT_PUBLIC_RAZORPAY_KEY_ID=rzp_live_xxx
+
+   Push to GitHub → Vercel auto-deploys.
+
+────────────────────────────────────────────────────────────────────────────
+5.5  CLOUDFLARE PAGES  (alternative for frontend)
+────────────────────────────────────────────────────────────────────────────
+
+   Why: unlimited bandwidth even on free tier, integrated with R2.
+        Slightly less Next.js-native than Vercel but works well.
+
+
+================================================================================
+6. PRODUCTION SECURITY CHECKLIST
+================================================================================
+
+These are the minimum controls before letting real users in.
+
+[ ] TLS EVERYWHERE
+    - DATABASE_URL ends with ?sslmode=require (or verify-full)
+    - REDIS_URL uses rediss:// (note double s)
+    - MINIO_SECURE=true with R2/S3
+    - Backend behind Cloudflare or your host's free TLS
+    - Frontend served over https only
+
+[ ] STRONG SECRETS
+    - SECRET_KEY: 64+ random chars (PowerShell:
+        -join ((48..57)+(65..90)+(97..122) | Get-Random -Count 64 | %{[char]$_}) )
+    - All DB / Redis / R2 / SMTP / Razorpay keys: provider-generated, never
+      reused across environments
+    - NEVER commit .env. Confirm `.env` is in .gitignore.
+
+[ ] SEPARATE ENVIRONMENTS
+    - dev .env  → dev DB / dev R2 bucket / Razorpay TEST keys
+    - prod .env → prod DB / prod R2 bucket / Razorpay LIVE keys
+    - Use Neon branching to clone prod data into dev safely.
+
+[ ] LEAST-PRIVILEGE TOKENS
+    - R2 token: scoped to a single bucket, read+write only
+    - Database role: only the privileges the app needs (no SUPERUSER)
+    - SMTP: use a dedicated sender, not your personal account
+
+[ ] APP_ENV=production
+    Set in production .env. This:
+      - Disables auto-creation of tables (use Alembic migrations instead)
+      - Reduces log verbosity
+      - Forces stricter security defaults
+
+[ ] APP_DEBUG=false  in production .env
+
+[ ] CORS / ALLOWED ORIGINS
+    Edit backend/app/core/config.py — `cors_origins` should ONLY include
+    your real frontend domain in production:
+        cors_origins = ["https://app.yourdomain.com"]
+    Not "*", not "http://localhost:3000".
+
+[ ] RATE LIMITS  (already enforced)
+    Default: 60/minute per user/IP. Increase for paid tiers if needed.
+
+[ ] FILE SECURITY  (already implemented)
+    - ClamAV virus scan on every upload (fail-closed)
+    - Extension + MIME sniffing validation
+    - SHA-256 hash + blacklist check
+    - Per-plan size limits enforced
+
+[ ] AUDIT LOG  (already implemented)
+    Logs auth events, virus detections, blacklist hits to audit_logs table.
+    Export this regularly for compliance / forensics.
+
+[ ] WEBHOOK VERIFICATION  (already implemented)
+    Razorpay webhook signature is validated with HMAC-SHA256 against
+    RAZORPAY_WEBHOOK_SECRET. NEVER skip this.
+
+[ ] PASSWORD POLICY  (recommended hardening)
+    Currently no min-length enforced on the API. Add to
+    backend/app/schemas/auth.py:
+        password: str = Field(min_length=12)
+
+[ ] DATABASE BACKUPS
+    - Neon: 7-day point-in-time restore on free tier (auto)
+    - Manual export weekly:
+        pg_dump "$DATABASE_URL" | gzip > backup-$(date +%F).sql.gz
+      Store these encrypted in R2 (different bucket than uploads).
+
+[ ] DEPENDENCY SCANNING
+    Run periodically:
+        pip install pip-audit
+        pip-audit -r backend/requirements.txt
+        cd frontend && npm audit
+    Patch high-severity vulnerabilities promptly.
+
+[ ] HTTPS REDIRECT
+    Ensure http:// requests redirect to https://. Cloudflare proxy does
+    this automatically with the "Always Use HTTPS" toggle.
+
+[ ] HSTS HEADER
+    On the public domain, set a HSTS header (max-age=31536000) once you're
+    confident TLS is working everywhere. Cloudflare → SSL/TLS → Edge
+    Certificates → "HTTP Strict Transport Security".
+
+[ ] DATABASE: NETWORK RESTRICTION
+    Where the host supports it (Neon, Supabase paid), restrict the DB to
+    accept connections only from your application host's IP. On Fly.io,
+    use private networking (.flycast) to skip the public internet entirely.
+
+[ ] LOGGING REDACTION
+    Never log:
+      - JWTs (already not logged)
+      - Passwords (already hashed before reaching logs)
+      - Razorpay secrets
+      - User uploaded content bytes
+    The structlog config in app/core/logging.py is conservative by default.
+
+[ ] ADMIN ACCOUNT
+    The first user you register has role=user. To make it admin:
+        docker exec -it deepfake-detector-backend-1 python -c \
+          "from app.db.session import SessionLocal; from app.models.user import User, UserRole; \
+           db=SessionLocal(); u=db.query(User).filter_by(email='you@example.com').first(); \
+           u.role=UserRole.ADMIN; db.commit(); print('promoted')"
+    DON'T expose any registration path that auto-grants admin.
+
+
+================================================================================
+7. SECRETS MANAGEMENT
+================================================================================
+
+Three valid approaches in order of complexity:
+
+────────────────────────────────────────────────────────────────────────────
+7.1  HOST-PROVIDER ENV VARS  (simplest; recommended for solo / small team)
+────────────────────────────────────────────────────────────────────────────
+
+   Fly.io:
+       fly secrets set DATABASE_URL="..." SECRET_KEY="..." RAZORPAY_KEY_SECRET="..."
+
+   Vercel:
+       Dashboard → Project → Settings → Environment Variables.
+       Mark sensitive ones as "Encrypted".
+
+   Cloudflare Workers/Pages:
+       wrangler secret put DATABASE_URL
+
+   Pros: simple, no extra cost.
+   Cons: each host has its own UI; no centralized rotation history.
+
+────────────────────────────────────────────────────────────────────────────
+7.2  DOPPLER  (centralized, free up to 5 users)
+────────────────────────────────────────────────────────────────────────────
+
+   - One place to manage all secrets per env (dev/staging/prod)
+   - Native integrations with Vercel, Fly, Railway, Render
+   - Audit trail of who changed what
+   - Free for small teams; https://doppler.com
+
+────────────────────────────────────────────────────────────────────────────
+7.3  SOPS + AGE  (advanced, git-native)
+────────────────────────────────────────────────────────────────────────────
+
+   Encrypt your .env in the repo with age public-key encryption. Decrypt
+   on deploy. Works fully offline, free, no third party.
+
+   https://github.com/getsops/sops
+
+
+================================================================================
+8. BACKUPS, MONITORING, INCIDENT RESPONSE
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────
+8.1  BACKUPS
+────────────────────────────────────────────────────────────────────────────
+
+   DATABASE
+       Neon free tier: 7-day automatic point-in-time restore.
+       Beyond that: weekly manual pg_dump to a separate R2 bucket.
+       Cron example (run on backend host):
+           0 3 * * 0 pg_dump "$DATABASE_URL" | gzip | \
+             aws s3 cp - s3://deepfake-backups/db-$(date +\%F).sql.gz \
+             --endpoint-url https://<acct>.r2.cloudflarestorage.com
+
+   FILES
+       R2 versioning (enable in bucket settings) gives soft-delete
+       protection. For real DR, enable cross-region replication on the
+       paid plan, OR weekly `rclone sync` to a second bucket.
+
+   CONFIGURATION
+       Keep .env (encrypted) and infra/docker-compose.yml in a private
+       git repo. Tag releases.
+
+   TEST RESTORES
+       Once a quarter, restore the latest backup into a Neon branch and
+       smoke-test it. Untested backups don't exist.
+
+────────────────────────────────────────────────────────────────────────────
+8.2  MONITORING / ALERTING (free options)
+────────────────────────────────────────────────────────────────────────────
+
+   UPTIME
+       UptimeRobot (https://uptimerobot.com) — 50 monitors free
+       Better Stack (formerly Better Uptime) — generous free tier
+       Hit /health every 60s. Alert via email/Slack on failure.
+
+   ERRORS
+       Sentry (https://sentry.io) — 5,000 errors/month free
+       Add to backend/requirements.txt:
+           sentry-sdk[fastapi]==2.18.0
+       And in app/main.py:
+           import sentry_sdk
+           sentry_sdk.init(dsn=os.getenv("SENTRY_DSN"), traces_sample_rate=0.1)
+
+   LOGS
+       Better Stack Logs / Logtail / Axiom — free tiers from 1-3 GB/mo
+       Or just keep `docker compose logs` and rotate weekly.
+
+   METRICS
+       Grafana Cloud free tier: 50 GB logs, 10k metric series, 14-day
+       retention. Self-host Prometheus + Grafana if you prefer.
+
+────────────────────────────────────────────────────────────────────────────
+8.3  INCIDENT RESPONSE PLAYBOOK
+────────────────────────────────────────────────────────────────────────────
+
+   COMPROMISED CREDENTIAL
+       1. Rotate the affected secret (DB password, R2 token, JWT key).
+       2. Update env vars on host; redeploy.
+       3. If JWT key rotated: all users forced to re-login (intended).
+       4. Review audit_logs for unusual activity since the leak window.
+
+   MALICIOUS UPLOAD ATTEMPT (ClamAV catches it)
+       1. Audit log entry already created (event=UPLOAD_INFECTED).
+       2. SHA-256 already added to malicious_hashes blacklist.
+       3. Review attacker's other recent activity by user_id and IP.
+       4. Consider IP-banning at Cloudflare WAF.
+
+   DB AT QUOTA
+       1. Trim audit_logs older than 90 days:
+              DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL '90 days';
+       2. Consider compressing old audit logs to R2 then deleting.
+       3. Upgrade Neon plan if you've outgrown 0.5 GB.
+
+   TLS CERTIFICATE EXPIRED
+       Shouldn't happen with Cloudflare/host-managed certs. If self-managed
+       (Let's Encrypt direct), make sure certbot's auto-renew is running.
+
+
+================================================================================
+9. WHAT NOT TO DO
+================================================================================
+
+   ✗ DON'T self-host Postgres on a $5 VPS for production.
+     You'll forget to back it up, the disk will fill, and one day it'll
+     just be gone. Managed Postgres is non-negotiable for production.
+
+   ✗ DON'T expose Postgres / Redis / MinIO ports directly to the internet.
+     Even with strong passwords, these are constantly probed. Use the
+     application host's private networking, or restrict by IP allowlist.
+
+   ✗ DON'T commit .env. Keep .env.example as a template only.
+
+   ✗ DON'T reuse secrets across environments. Rotate them when staff leave.
+
+   ✗ DON'T use Razorpay TEST keys in production — payments won't actually
+     happen, and verifying a test signature with a live secret will fail.
+
+   ✗ DON'T skip ClamAV "to make uploads faster". The fail-closed virus scan
+     is the entire point of the secure upload pipeline.
+
+   ✗ DON'T set CORS to "*" in production.
+
+   ✗ DON'T trust client-side rate limits or quota counters. The backend
+     enforcement is what matters.
+
+   ✗ DON'T let APP_DEBUG=true reach production.
+
+   ✗ DON'T expose Flower (Celery dashboard, port 5555) on a public domain
+     without auth. Either keep it on a private network, or put Basic Auth
+     in front of it via Cloudflare Access.
+
+
+================================================================================
+APPENDIX A — FREE-TIER ARCHITECTURE DIAGRAM
+================================================================================
+
+      Users
+        │  https
+        ▼
+    Cloudflare (DNS + TLS proxy + WAF)
+        │
+    ┌───┴────────────────────────────┐
+    │                                │
+    ▼                                ▼
+  Vercel                         Fly.io
+  (frontend)                     ┌─────────────────────────┐
+                                 │  backend container      │
+                                 │  worker container       │
+                                 │  clamav container       │
+                                 └────────────┬────────────┘
+                                              │  TLS
+                  ┌───────────────────────────┼───────────────────────┐
+                  ▼                           ▼                       ▼
+              Neon                      Cloudflare R2           Upstash Redis
+            (Postgres)                (uploaded files)        (queue + cache)
+            sslmode=require           https-only              rediss://
+
+
+================================================================================
+APPENDIX B — MINIMUM "GO LIVE" CHECKLIST
+================================================================================
+
+Use this on the day you flip from staging to production.
+
+[ ] APP_ENV=production in .env
+[ ] APP_DEBUG=false
+[ ] SECRET_KEY rotated to new 64-char value
+[ ] DATABASE_URL points at Neon (not local Docker postgres)
+[ ] sslmode=require in DATABASE_URL
+[ ] R2 credentials configured; MINIO_SECURE=true
+[ ] Razorpay LIVE keys (not test)
+[ ] Razorpay webhook configured + RAZORPAY_WEBHOOK_SECRET set
+[ ] SMTP working (test by triggering /auth/forgot-password)
+[ ] Custom domain configured with TLS
+[ ] CORS allow-list updated to production frontend domain only
+[ ] First admin user promoted via DB CLI
+[ ] /health returns 200 with "clamav": true
+[ ] Test register, login, upload, scan, history, PDF, payment end-to-end
+[ ] UptimeRobot monitor created on /health
+[ ] Sentry DSN configured (optional but recommended)
+[ ] Backup cron scheduled
+[ ] .env NOT in git (verify with `git ls-files | grep .env`)
+[ ] Documentation handed off to team / future-you
+
+
+================================================================================
+END OF PRODUCTION DEPLOYMENT GUIDE
+================================================================================
+
+db check
+docker compose -f infra/docker-compose.yml exec postgres psql -U deepfake -d deepfake_db
+
+https://console.neon.tech/
+shivam.mishra7733@gmail.com
+Hanuman@$99m
+
+postgresql://neondb_owner:npg_xdjbeH4aZJG2@ep-orange-meadow-an1vtqgr.c-6.us-east-1.aws.neon.tech/neondb?sslmode=require
+
+Project → Roles → click on neondb_owner → Reset password → copy the new connection string into your production .env.
+
+
+
+info.deepfakedetector@gmail.com
+Hanuman@1
+deepfakedetector
+uykg acut qeix gfsh
+
+Grafana
+admin
+deepfake@$99m
+
+
+razorpay
+rzp_test_Si3W8CiHylkvYk
+l9LVHCUak2Yw6Gr5XXv6OOaY
+18857410

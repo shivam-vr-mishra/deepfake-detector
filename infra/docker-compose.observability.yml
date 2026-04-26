@@ -1,0 +1,101 @@
+# =============================================================
+# Observability stack: Loki (log store) + Promtail (shipper) + Grafana (UI)
+# Optional Dozzle for a zero-config live-tail alternative.
+#
+# Usage (from repo root):
+#   docker compose -f infra/docker-compose.yml \
+#                  -f infra/docker-compose.observability.yml \
+#                  --env-file .env up -d
+#
+# Or with the helper scripts: start.ps1 / start.sh (we extend them below).
+#
+# Endpoints (after ~10s):
+#   Grafana   http://localhost:3001   (admin / ${GRAFANA_PASSWORD:-admin})
+#   Loki API  http://localhost:3100
+#   Dozzle    http://localhost:9999   (no auth by default — enable below)
+# =============================================================
+
+name: deepfake-detector
+
+services:
+  loki:
+    image: grafana/loki:3.0.0
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yaml
+    volumes:
+      - ./observability/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki_data:/loki
+    ports:
+      - "127.0.0.1:3100:3100" # bind to localhost only — never expose publicly
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:3100/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/promtail-config.yaml
+    volumes:
+      - ./observability/promtail/promtail-config.yaml:/etc/promtail/promtail-config.yaml:ro
+      # Docker socket → service discovery of every container's logs
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # The actual log files live here on Linux/Docker-Desktop
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - promtail_positions:/tmp/promtail
+    depends_on:
+      loki:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana-oss:11.1.4
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: ""
+      GF_FEATURE_TOGGLES_ENABLE: "logsExploreTableVisualisation"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    depends_on:
+      loki:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  # ------- Optional 1-container alternative -------
+  # If you find Grafana overkill, just run Dozzle and forget about Loki:
+  #   docker compose -f infra/docker-compose.yml \
+  #                  -f infra/docker-compose.observability.yml \
+  #                  --profile dozzle up -d dozzle
+  dozzle:
+    image: amir20/dozzle:latest
+    restart: unless-stopped
+    profiles: ["dozzle"]
+    environment:
+      DOZZLE_LEVEL: info
+      DOZZLE_NO_ANALYTICS: "true"
+      # Set DOZZLE_USERNAME/DOZZLE_PASSWORD in .env to enable basic auth.
+      DOZZLE_USERNAME: ${DOZZLE_USERNAME:-}
+      DOZZLE_PASSWORD: ${DOZZLE_PASSWORD:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "127.0.0.1:9999:8080"
+
+volumes:
+  loki_data:
+  promtail_positions:
+  grafana_data:

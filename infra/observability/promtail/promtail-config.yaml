@@ -1,0 +1,67 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/promtail/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  # ------------------------------------------------------------------
+  # Scrape every Docker container's logs via the Docker socket.
+  # Containers can opt out by setting label `logging=disabled`.
+  # ------------------------------------------------------------------
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+        filters:
+          - name: label
+            values: ["com.docker.compose.project=deepfake-detector"]
+
+    relabel_configs:
+      # Drop containers that explicitly opt out
+      - source_labels: ["__meta_docker_container_label_logging"]
+        regex: "disabled"
+        action: drop
+
+      - source_labels: ["__meta_docker_container_name"]
+        regex: "/(.*)"
+        target_label: "container"
+
+      - source_labels: ["__meta_docker_container_label_com_docker_compose_service"]
+        target_label: "service"
+
+      - source_labels: ["__meta_docker_container_label_com_docker_compose_project"]
+        target_label: "project"
+
+      - source_labels: ["__meta_docker_container_log_stream"]
+        target_label: "stream"
+
+    pipeline_stages:
+      # Try to parse the line as JSON (structlog output). On success we get
+      # `level`, `event`, `timestamp` and any custom keys as extracted fields.
+      - json:
+          expressions:
+            level: level
+            event: event
+            timestamp: timestamp
+            user_id: user_id
+            error_type: error_type
+        # If the line isn't JSON (e.g. uvicorn access log), this stage just
+        # leaves the line unchanged.
+
+      # Promote a couple of fields to Loki labels so they're cheap to filter on.
+      # Keep this list TIGHT — every label = a separate stream in Loki.
+      - labels:
+          level:
+
+      # Use the JSON timestamp when available; otherwise Promtail's wall clock.
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano
+          fallback_formats:
+            - RFC3339
+          action_on_failure: skip
